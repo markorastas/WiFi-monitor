@@ -1,41 +1,28 @@
-# Wi-Fi Monitor
+# WiFi Monitor
 
-A lightweight Windows system tray utility that monitors your local Wi-Fi (`/24`) network and notifies you when devices join or leave.
+A small, lightweight Windows app that sits quietly next to your clock and lets you know whenever a device joins or leaves your Wi-Fi network.
 
-## Features
+## What It Does
 
-- **System tray icon** next to the Windows clock with a right-click menu listing all active devices (`IP — Hostname`), a **Notifications** toggle, and **Quit**.
-- **Join & Leave notifications** via native Windows notifications.
-- **Near-zero system load** — uses native Win32 APIs (`IcmpSendEcho`, `GetIpNetTable`, and `SendARP` from `iphlpapi.dll`) directly in-process:
-  - Zero subprocesses and no flashing console windows.
-  - Works on any Windows display language.
-  - Two-tier scanning: fast live ARP verification on known devices every **5 seconds** (~0% CPU) and full `/24` discovery every **30 seconds**.
-  - 2-check grace period (~10–15 s) before reporting a device as disconnected to reduce false alarms from sleeping phones.
-- **Single-instance guard** via a Windows mutex.
-- **Single-file implementation** (`wifi_monitor.py`).
+- **Instant notifications** — shows a clean popup in the bottom-right corner whenever a device connects to or disconnects from your Wi-Fi.
+- **See connected devices** — right-click the green Wi-Fi icon next to the Windows clock to view the devices currently on your network.
+- **Simple controls** — right-click to toggle notifications on or off, or quit the app.
+- **Runs quietly in the background** — designed to stay out of your way without slowing down your PC.
 
-## Requirements
+## Download & Install
 
-- Windows 10 / 11
-- Python 3.10+
-- `pystray` and `Pillow`
+1. Go to the [Releases](https://github.com/markorastas/WiFi-monitor/releases) page and download **`WiFiMonitor-Setup.exe`**.
+2. Double-click the installer and follow the steps on screen.
+3. Keep **"Start WiFi Monitor automatically when Windows starts"** checked if you want it to run automatically after a restart.
 
-```powershell
-pip install pystray Pillow
-```
+*(If Windows SmartScreen shows a warning on first run, click **More info → Run anyway**.)*
 
-## Usage
+## Uninstall
 
-Run silently in the background (no console window):
+Open Windows **Settings → Apps → Installed apps** (Add or remove programs), find **WiFi Monitor**, and click **Uninstall**. The app, its files, and its automatic startup entry are completely removed.
 
-```powershell
-pythonw wifi_monitor.py
-```
+## License & Disclaimer
 
-Or run from a terminal:
+Licensed under the [MIT License](LICENSE).
 
-```powershell
-python wifi_monitor.py
-```
-
-Right-click the green Wi-Fi icon in the system tray to view connected devices, toggle notifications, or quit.
+This software is provided **"AS IS"** without warranty of any kind. You install and use it entirely at your own risk, and only on networks that you own or have permission to monitor.

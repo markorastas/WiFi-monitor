@@ -1,0 +1,27 @@
+IMPORTANT NOTICE & DISCLAIMER
+
+Please read carefully before installing WiFi Monitor:
+
+1. NO WARRANTY ("AS IS"):
+   WiFi Monitor is provided strictly "AS IS" and "AS AVAILABLE", without warranty
+   of any kind, express or implied, including but not limited to merchantability,
+   fitness for a particular purpose, accuracy, reliability, or non-infringement.
+
+2. LIMITATION OF LIABILITY:
+   You install and use this software entirely at your own risk. In no event shall
+   the author or copyright holder (Marko Rastas) be liable for any direct,
+   indirect, incidental, special, exemplary, or consequential damages, loss of
+   data, network disruption, or any other claim arising from the use or inability
+   to use this software.
+
+3. AUTHORIZED NETWORKS ONLY:
+   This tool scans devices on the local network using standard ARP/ICMP requests.
+   You are solely responsible for ensuring that you only run WiFi Monitor on
+   networks that you own or have explicit permission to monitor, and in compliance
+   with all applicable local laws and policies.
+
+4. NO SUPPORT OBLIGATION:
+   This software is provided free of charge under the MIT License with no
+   obligation to provide updates, bug fixes, or technical support.
+
+By proceeding with the installation, you acknowledge and agree to these terms.
