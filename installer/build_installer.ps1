@@ -22,6 +22,7 @@ python -m PyInstaller `
     --exclude-module unittest `
     --exclude-module pytest `
     --exclude-module gi `
+    --exclude-module pystray `
     wifi_monitor.py
 
 Write-Host "3/3 Building Windows installer with Inno Setup..." -ForegroundColor Cyan

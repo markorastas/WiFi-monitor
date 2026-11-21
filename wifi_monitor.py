@@ -1,5 +1,5 @@
 """
-Wi-Fi Monitor — Lightweight Windows System Tray Network Monitor.
+WiFi Monitor — Lightweight Windows System Tray Network Monitor.
 
 Two-tier background scanning using native Win32 APIs (zero subprocesses):
 - Fast check every 5s: live SendARP on known devices + OS ARP table (~0% CPU)
@@ -18,11 +18,8 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
-import pystray
-from pystray._util import win32 as _pystray_win32
-from pystray._win32 import Icon as _Win32Icon
 from PIL import Image, ImageDraw
 
 APP_NAME = "WiFi Monitor"
@@ -35,7 +32,9 @@ DNS_WORKERS = 8
 MIB_IPNET_TYPE_DYNAMIC = 3
 MUTEX_NAME = "Global\\WiFiMonitorTrayApp_SingleInstance_Mutex"
 
-# Win32 iphlpapi.dll bindings (zero subprocesses, language-independent)
+# ---------------------------------------------------------------------------
+# Win32 network API bindings (iphlpapi.dll — zero subprocesses)
+# ---------------------------------------------------------------------------
 _iphlpapi = ctypes.windll.iphlpapi
 _iphlpapi.IcmpCreateFile.restype = ctypes.c_void_p
 _iphlpapi.IcmpCloseHandle.argtypes = [ctypes.c_void_p]
@@ -76,6 +75,418 @@ class _MIB_IPNETROW(ctypes.Structure):
     ]
 
 
+# ---------------------------------------------------------------------------
+# Win32 UI bindings (user32, gdi32, shell32, dwmapi, uxtheme)
+# ---------------------------------------------------------------------------
+_user32 = ctypes.windll.user32
+_gdi32 = ctypes.windll.gdi32
+_kernel32 = ctypes.windll.kernel32
+_shell32 = ctypes.windll.shell32
+
+try:
+    _uxtheme = ctypes.windll.uxtheme
+except OSError:
+    _uxtheme = None
+
+try:
+    _dwmapi = ctypes.windll.dwmapi
+except OSError:
+    _dwmapi = None
+
+_WS_POPUP = 0x80000000
+_WS_EX_TOPMOST = 0x00000008
+_WS_EX_TOOLWINDOW = 0x00000080
+_WS_EX_NOACTIVATE = 0x08000000
+
+_SW_HIDE = 0
+_SW_SHOWNOACTIVATE = 4
+_SWP_NOACTIVATE = 0x0010
+_SWP_SHOWWINDOW = 0x0040
+_HWND_TOPMOST = -1
+
+_WM_DESTROY = 0x0002
+_WM_PAINT = 0x000F
+_WM_SETCURSOR = 0x0020
+_WM_DRAWITEM = 0x002B
+_WM_MEASUREITEM = 0x002C
+_WM_TIMER = 0x0113
+_WM_LBUTTONUP = 0x0202
+_WM_RBUTTONUP = 0x0205
+_WM_TRAYICON = 0x8001
+_WM_APP_UPDATE_TRAY = 0x8002
+_WM_APP_QUIT_TRAY = 0x8003
+_WM_APP_SHOW_TOAST = 0x8010
+_WM_APP_QUIT_TOAST = 0x8011
+
+_IDC_ARROW = 32512
+_ODT_MENU = 1
+_COLOR_WINDOW = 5
+_COLOR_MENUTEXT = 7
+_TRANSPARENT = 1
+_DT_LEFT = 0x00000000
+_DT_RIGHT = 0x00000002
+_DT_VCENTER = 0x00000004
+_DT_SINGLELINE = 0x00000020
+_DT_NOPREFIX = 0x00000800
+_DT_END_ELLIPSIS = 0x00008000
+_SPI_GETNONCLIENTMETRICS = 0x0029
+_SPI_GETWORKAREA = 0x0030
+_MENU_POPUPBACKGROUND = 9
+_DWMWA_WINDOW_CORNER_PREFERENCE = 33
+_DWMWCP_ROUND = 2
+_FW_NORMAL = 400
+_FW_SEMIBOLD = 600
+_DEFAULT_CHARSET = 1
+_CLEARTYPE_QUALITY = 5
+_DIB_RGB_COLORS = 0
+
+_NIM_ADD = 0x00000000
+_NIM_MODIFY = 0x00000001
+_NIM_DELETE = 0x00000002
+_NIF_MESSAGE = 0x00000001
+_NIF_ICON = 0x00000002
+_NIF_TIP = 0x00000004
+
+_MIIM_STATE = 0x00000001
+_MIIM_ID = 0x00000002
+_MIIM_DATA = 0x00000020
+_MIIM_STRING = 0x00000040
+_MIIM_FTYPE = 0x00000100
+_MFT_STRING = 0x00000000
+_MFT_OWNERDRAW = 0x00000100
+_MFT_SEPARATOR = 0x00000800
+_MFS_DISABLED = 0x00000003
+_MFS_CHECKED = 0x00000008
+
+_TPM_RIGHTALIGN = 0x0008
+_TPM_BOTTOMALIGN = 0x0020
+_TPM_RETURNCMD = 0x0100
+
+_MENU_ID_NOTIFICATIONS = 1001
+_MENU_ID_QUIT = 1002
+_TOAST_TIMER_ID = 1
+_TOAST_DURATION_MS = 6000
+
+
+def _rgb(r: int, g: int, b: int) -> int:
+    return r | (g << 8) | (b << 16)
+
+
+_WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+)
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", wintypes.BYTE * 8),
+    ]
+
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT),
+        ("uFlags", wintypes.UINT),
+        ("uCallbackMessage", wintypes.UINT),
+        ("hIcon", wintypes.HICON),
+        ("szTip", wintypes.WCHAR * 128),
+        ("dwState", wintypes.DWORD),
+        ("dwStateMask", wintypes.DWORD),
+        ("szInfo", wintypes.WCHAR * 256),
+        ("uVersion", wintypes.UINT),
+        ("szInfoTitle", wintypes.WCHAR * 64),
+        ("dwInfoFlags", wintypes.DWORD),
+        ("guidItem", _GUID),
+        ("hBalloonIcon", wintypes.HICON),
+    ]
+
+
+class _MENUITEMINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("fMask", wintypes.UINT),
+        ("fType", wintypes.UINT),
+        ("fState", wintypes.UINT),
+        ("wID", wintypes.UINT),
+        ("hSubMenu", wintypes.HMENU),
+        ("hbmpChecked", wintypes.HBITMAP),
+        ("hbmpUnchecked", wintypes.HBITMAP),
+        ("dwItemData", ctypes.c_size_t),
+        ("dwTypeData", wintypes.LPWSTR),
+        ("cch", wintypes.UINT),
+        ("hbmpItem", wintypes.HBITMAP),
+    ]
+
+
+class _WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", _WNDPROC),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HANDLE),
+        ("hbrBackground", wintypes.HBRUSH),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+        ("hIconSm", wintypes.HICON),
+    ]
+
+
+class _PAINTSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("hdc", wintypes.HDC),
+        ("fErase", wintypes.BOOL),
+        ("rcPaint", wintypes.RECT),
+        ("fRestore", wintypes.BOOL),
+        ("fIncUpdate", wintypes.BOOL),
+        ("rgbReserved", ctypes.c_byte * 32),
+    ]
+
+
+class _LOGFONTW(ctypes.Structure):
+    _fields_ = [
+        ("lfHeight", wintypes.LONG),
+        ("lfWidth", wintypes.LONG),
+        ("lfEscapement", wintypes.LONG),
+        ("lfOrientation", wintypes.LONG),
+        ("lfWeight", wintypes.LONG),
+        ("lfItalic", wintypes.BYTE),
+        ("lfUnderline", wintypes.BYTE),
+        ("lfStrikeOut", wintypes.BYTE),
+        ("lfCharSet", wintypes.BYTE),
+        ("lfOutPrecision", wintypes.BYTE),
+        ("lfClipPrecision", wintypes.BYTE),
+        ("lfQuality", wintypes.BYTE),
+        ("lfPitchAndFamily", wintypes.BYTE),
+        ("lfFaceName", wintypes.WCHAR * 32),
+    ]
+
+
+class _NONCLIENTMETRICSW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("iBorderWidth", ctypes.c_int),
+        ("iScrollWidth", ctypes.c_int),
+        ("iScrollHeight", ctypes.c_int),
+        ("iCaptionWidth", ctypes.c_int),
+        ("iCaptionHeight", ctypes.c_int),
+        ("lfCaptionFont", _LOGFONTW),
+        ("iSmCaptionWidth", ctypes.c_int),
+        ("iSmCaptionHeight", ctypes.c_int),
+        ("lfSmCaptionFont", _LOGFONTW),
+        ("iMenuWidth", ctypes.c_int),
+        ("iMenuHeight", ctypes.c_int),
+        ("lfMenuFont", _LOGFONTW),
+        ("lfStatusFont", _LOGFONTW),
+        ("lfMessageFont", _LOGFONTW),
+        ("iPaddedBorderWidth", ctypes.c_int),
+    ]
+
+
+class _MEASUREITEMSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("CtlType", wintypes.UINT),
+        ("CtlID", wintypes.UINT),
+        ("itemID", wintypes.UINT),
+        ("itemWidth", wintypes.UINT),
+        ("itemHeight", wintypes.UINT),
+        ("itemData", ctypes.c_size_t),
+    ]
+
+
+class _DRAWITEMSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("CtlType", wintypes.UINT),
+        ("CtlID", wintypes.UINT),
+        ("itemID", wintypes.UINT),
+        ("itemAction", wintypes.UINT),
+        ("itemState", wintypes.UINT),
+        ("hwndItem", wintypes.HWND),
+        ("hDC", wintypes.HDC),
+        ("rcItem", wintypes.RECT),
+        ("itemData", ctypes.c_size_t),
+    ]
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class _ICONINFO(ctypes.Structure):
+    _fields_ = [
+        ("fIcon", wintypes.BOOL),
+        ("xHotspot", wintypes.DWORD),
+        ("yHotspot", wintypes.DWORD),
+        ("hbmMask", wintypes.HBITMAP),
+        ("hbmColor", wintypes.HBITMAP),
+    ]
+
+
+_kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+_kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+_shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(_NOTIFYICONDATAW)]
+_shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+
+_user32.RegisterClassExW.argtypes = [ctypes.POINTER(_WNDCLASSEXW)]
+_user32.RegisterClassExW.restype = wintypes.ATOM
+_user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+_user32.UnregisterClassW.restype = wintypes.BOOL
+_user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+_user32.RegisterWindowMessageW.restype = wintypes.UINT
+_user32.CreateWindowExW.argtypes = [
+    wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+]
+_user32.CreateWindowExW.restype = wintypes.HWND
+_user32.DestroyWindow.argtypes = [wintypes.HWND]
+_user32.DestroyWindow.restype = wintypes.BOOL
+_user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+_user32.DefWindowProcW.restype = ctypes.c_ssize_t
+_user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+_user32.SetForegroundWindow.restype = wintypes.BOOL
+_user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+_user32.GetCursorPos.restype = wintypes.BOOL
+_user32.CreatePopupMenu.argtypes = []
+_user32.CreatePopupMenu.restype = wintypes.HMENU
+_user32.DestroyMenu.argtypes = [wintypes.HMENU]
+_user32.DestroyMenu.restype = wintypes.BOOL
+_user32.InsertMenuItemW.argtypes = [wintypes.HMENU, wintypes.UINT, wintypes.BOOL, ctypes.POINTER(_MENUITEMINFOW)]
+_user32.InsertMenuItemW.restype = wintypes.BOOL
+_user32.TrackPopupMenuEx.argtypes = [
+    wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int, wintypes.HWND, ctypes.c_void_p
+]
+_user32.TrackPopupMenuEx.restype = wintypes.BOOL
+_user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.ShowWindow.restype = wintypes.BOOL
+_user32.SetWindowPos.argtypes = [
+    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, wintypes.UINT,
+]
+_user32.SetWindowPos.restype = wintypes.BOOL
+_user32.InvalidateRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT), wintypes.BOOL]
+_user32.InvalidateRect.restype = wintypes.BOOL
+_user32.BeginPaint.argtypes = [wintypes.HWND, ctypes.POINTER(_PAINTSTRUCT)]
+_user32.BeginPaint.restype = wintypes.HDC
+_user32.EndPaint.argtypes = [wintypes.HWND, ctypes.POINTER(_PAINTSTRUCT)]
+_user32.EndPaint.restype = wintypes.BOOL
+_user32.GetDC.argtypes = [wintypes.HWND]
+_user32.GetDC.restype = wintypes.HDC
+_user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+_user32.ReleaseDC.restype = ctypes.c_int
+_user32.FillRect.argtypes = [wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH]
+_user32.FillRect.restype = ctypes.c_int
+_user32.FrameRect.argtypes = [wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH]
+_user32.FrameRect.restype = ctypes.c_int
+_user32.GetSysColor.argtypes = [ctypes.c_int]
+_user32.GetSysColor.restype = wintypes.DWORD
+_user32.GetSysColorBrush.argtypes = [ctypes.c_int]
+_user32.GetSysColorBrush.restype = wintypes.HBRUSH
+_user32.DrawTextW.argtypes = [
+    wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(wintypes.RECT), wintypes.UINT
+]
+_user32.DrawTextW.restype = ctypes.c_int
+_user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
+_user32.SystemParametersInfoW.restype = wintypes.BOOL
+_user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
+_user32.LoadCursorW.restype = wintypes.HANDLE
+_user32.SetCursor.argtypes = [wintypes.HANDLE]
+_user32.SetCursor.restype = wintypes.HANDLE
+_user32.CreateIconIndirect.argtypes = [ctypes.POINTER(_ICONINFO)]
+_user32.CreateIconIndirect.restype = wintypes.HICON
+_user32.DestroyIcon.argtypes = [wintypes.HICON]
+_user32.DestroyIcon.restype = wintypes.BOOL
+_user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, wintypes.UINT, ctypes.c_void_p]
+_user32.SetTimer.restype = ctypes.c_size_t
+_user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
+_user32.KillTimer.restype = wintypes.BOOL
+_user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+_user32.PostMessageW.restype = wintypes.BOOL
+_user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+_user32.GetMessageW.restype = wintypes.BOOL
+_user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+_user32.TranslateMessage.restype = wintypes.BOOL
+_user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+_user32.DispatchMessageW.restype = ctypes.c_ssize_t
+_user32.PostQuitMessage.argtypes = [ctypes.c_int]
+_user32.PostQuitMessage.restype = None
+
+_gdi32.CreateFontIndirectW.argtypes = [ctypes.POINTER(_LOGFONTW)]
+_gdi32.CreateFontIndirectW.restype = wintypes.HFONT
+_gdi32.CreateFontW.argtypes = [
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+    wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.LPCWSTR,
+]
+_gdi32.CreateFontW.restype = wintypes.HFONT
+_gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+_gdi32.SelectObject.restype = wintypes.HGDIOBJ
+_gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+_gdi32.DeleteObject.restype = wintypes.BOOL
+_gdi32.SetBkMode.argtypes = [wintypes.HDC, ctypes.c_int]
+_gdi32.SetBkMode.restype = ctypes.c_int
+_gdi32.SetTextColor.argtypes = [wintypes.HDC, wintypes.DWORD]
+_gdi32.SetTextColor.restype = wintypes.DWORD
+_gdi32.GetTextExtentPoint32W.argtypes = [
+    wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(wintypes.SIZE)
+]
+_gdi32.GetTextExtentPoint32W.restype = wintypes.BOOL
+_gdi32.CreateSolidBrush.argtypes = [wintypes.DWORD]
+_gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+_gdi32.CreatePen.argtypes = [ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+_gdi32.CreatePen.restype = wintypes.HPEN
+_gdi32.Ellipse.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+_gdi32.Ellipse.restype = wintypes.BOOL
+_gdi32.CreateDIBSection.argtypes = [
+    wintypes.HDC, ctypes.POINTER(_BITMAPINFOHEADER), wintypes.UINT,
+    ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD,
+]
+_gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+_gdi32.CreateBitmap.argtypes = [ctypes.c_int, ctypes.c_int, wintypes.UINT, wintypes.UINT, ctypes.c_void_p]
+_gdi32.CreateBitmap.restype = wintypes.HBITMAP
+
+if _uxtheme is not None:
+    _uxtheme.OpenThemeData.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+    _uxtheme.OpenThemeData.restype = ctypes.c_void_p
+    _uxtheme.CloseThemeData.argtypes = [ctypes.c_void_p]
+    _uxtheme.CloseThemeData.restype = ctypes.c_long
+    _uxtheme.DrawThemeBackground.argtypes = [
+        ctypes.c_void_p, wintypes.HDC, ctypes.c_int, ctypes.c_int,
+        ctypes.POINTER(wintypes.RECT), ctypes.POINTER(wintypes.RECT),
+    ]
+    _uxtheme.DrawThemeBackground.restype = ctypes.c_long
+
+if _dwmapi is not None:
+    _dwmapi.DwmSetWindowAttribute.argtypes = [
+        wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD
+    ]
+    _dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+
+
+# ---------------------------------------------------------------------------
+# Network scanning helpers
+# ---------------------------------------------------------------------------
 @dataclass
 class Device:
     ip: str
@@ -86,13 +497,12 @@ class Device:
 
 
 def acquire_single_instance_mutex() -> Optional[int]:
-    """Ensure only one instance of Wi-Fi Monitor runs at a time."""
-    kernel32 = ctypes.windll.kernel32
-    handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    """Ensure only one instance of WiFi Monitor runs at a time."""
+    handle = _kernel32.CreateMutexW(None, False, MUTEX_NAME)
     ERROR_ALREADY_EXISTS = 183
-    if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+    if _kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
         if handle:
-            kernel32.CloseHandle(handle)
+            _kernel32.CloseHandle(handle)
         return None
     return handle
 
@@ -200,6 +610,9 @@ def ip_sort_key(ip: str) -> Tuple[int, ...]:
         return (999, 999, 999, 999)
 
 
+# ---------------------------------------------------------------------------
+# Icon creation (in-memory HICON from Pillow RGBA)
+# ---------------------------------------------------------------------------
 def create_tray_icon_image(state: str = "online") -> Image.Image:
     """Draw a clean 64x64 Wi-Fi icon for the Windows system tray."""
     size = 64
@@ -213,174 +626,89 @@ def create_tray_icon_image(state: str = "online") -> Image.Image:
     else:
         accent = (46, 204, 113, 255)   # Green
 
-    # Subtle dark circular badge for contrast on both light & dark taskbars
     draw.ellipse((2, 2, size - 2, size - 2), fill=(28, 32, 38, 240), outline=accent, width=3)
-
-    # Wi-Fi arcs
     draw.arc((12, 16, 52, 56), start=225, end=315, fill=accent, width=4)
     draw.arc((20, 24, 44, 48), start=225, end=315, fill=accent, width=4)
-    # Center dot
     draw.ellipse((28, 40, 36, 48), fill=accent)
-
     return img
 
 
-# Win32 owner-draw bindings for static (black text, no hover, non-clickable) menu rows
-_user32 = ctypes.windll.user32
-_gdi32 = ctypes.windll.gdi32
-try:
-    _uxtheme = ctypes.windll.uxtheme
-except OSError:
-    _uxtheme = None
+def pil_to_hicon(img: Image.Image) -> int:
+    """Convert a Pillow RGBA image directly into a Win32 HICON in memory."""
+    rgba = img.convert("RGBA")
+    w, h = rgba.size
+    bgra = rgba.tobytes("raw", "BGRA")
 
-_WM_SETCURSOR = 0x0020
-_WM_DRAWITEM = 0x002B
-_WM_MEASUREITEM = 0x002C
-_IDC_ARROW = 32512
-_ODT_MENU = 1
-_COLOR_WINDOW = 5
-_COLOR_MENUTEXT = 7
-_TRANSPARENT = 1
-_DT_LEFT = 0x00000000
-_DT_VCENTER = 0x00000004
-_DT_SINGLELINE = 0x00000020
-_DT_NOPREFIX = 0x00000800
-_SPI_GETNONCLIENTMETRICS = 0x0029
-_MENU_POPUPBACKGROUND = 9
+    bmi = _BITMAPINFOHEADER()
+    bmi.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+    bmi.biWidth = w
+    bmi.biHeight = -h  # Top-down DIB
+    bmi.biPlanes = 1
+    bmi.biBitCount = 32
+    bmi.biCompression = 0  # BI_RGB
 
+    bits_ptr = ctypes.c_void_p()
+    hbm_color = _gdi32.CreateDIBSection(
+        None, ctypes.byref(bmi), _DIB_RGB_COLORS, ctypes.byref(bits_ptr), None, 0
+    )
+    if not hbm_color:
+        raise RuntimeError("CreateDIBSection failed")
 
-class _LOGFONTW(ctypes.Structure):
-    _fields_ = [
-        ("lfHeight", wintypes.LONG),
-        ("lfWidth", wintypes.LONG),
-        ("lfEscapement", wintypes.LONG),
-        ("lfOrientation", wintypes.LONG),
-        ("lfWeight", wintypes.LONG),
-        ("lfItalic", wintypes.BYTE),
-        ("lfUnderline", wintypes.BYTE),
-        ("lfStrikeOut", wintypes.BYTE),
-        ("lfCharSet", wintypes.BYTE),
-        ("lfOutPrecision", wintypes.BYTE),
-        ("lfClipPrecision", wintypes.BYTE),
-        ("lfQuality", wintypes.BYTE),
-        ("lfPitchAndFamily", wintypes.BYTE),
-        ("lfFaceName", wintypes.WCHAR * 32),
-    ]
+    ctypes.memmove(bits_ptr, bgra, len(bgra))
+    hbm_mask = _gdi32.CreateBitmap(w, h, 1, 1, None)
+
+    icon_info = _ICONINFO()
+    icon_info.fIcon = True
+    icon_info.hbmMask = hbm_mask
+    icon_info.hbmColor = hbm_color
+    hicon = _user32.CreateIconIndirect(ctypes.byref(icon_info))
+
+    _gdi32.DeleteObject(hbm_color)
+    _gdi32.DeleteObject(hbm_mask)
+    return hicon
 
 
-class _NONCLIENTMETRICSW(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.UINT),
-        ("iBorderWidth", ctypes.c_int),
-        ("iScrollWidth", ctypes.c_int),
-        ("iScrollHeight", ctypes.c_int),
-        ("iCaptionWidth", ctypes.c_int),
-        ("iCaptionHeight", ctypes.c_int),
-        ("lfCaptionFont", _LOGFONTW),
-        ("iSmCaptionWidth", ctypes.c_int),
-        ("iSmCaptionHeight", ctypes.c_int),
-        ("lfSmCaptionFont", _LOGFONTW),
-        ("iMenuWidth", ctypes.c_int),
-        ("iMenuHeight", ctypes.c_int),
-        ("lfMenuFont", _LOGFONTW),
-        ("lfStatusFont", _LOGFONTW),
-        ("lfMessageFont", _LOGFONTW),
-        ("iPaddedBorderWidth", ctypes.c_int),
-    ]
+# ---------------------------------------------------------------------------
+# Pure Win32 System Tray Icon & Owner-Draw Context Menu (zero LGPL deps)
+# ---------------------------------------------------------------------------
+class NativeTrayIcon:
+    """Pure Win32 system tray icon with static black-text device list menu."""
 
+    def __init__(
+        self,
+        get_menu_state: Callable[[], Tuple[List[str], bool]],
+        on_toggle_notifications: Callable[[], None],
+        on_quit: Callable[[], None],
+        on_ready: Callable[[], None],
+    ) -> None:
+        self._get_menu_state = get_menu_state
+        self._on_toggle_notifications = on_toggle_notifications
+        self._on_quit = on_quit
+        self._on_ready = on_ready
 
-class _MEASUREITEMSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("CtlType", wintypes.UINT),
-        ("CtlID", wintypes.UINT),
-        ("itemID", wintypes.UINT),
-        ("itemWidth", wintypes.UINT),
-        ("itemHeight", wintypes.UINT),
-        ("itemData", ctypes.c_size_t),
-    ]
-
-
-class _DRAWITEMSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("CtlType", wintypes.UINT),
-        ("CtlID", wintypes.UINT),
-        ("itemID", wintypes.UINT),
-        ("itemAction", wintypes.UINT),
-        ("itemState", wintypes.UINT),
-        ("hwndItem", wintypes.HWND),
-        ("hDC", wintypes.HDC),
-        ("rcItem", wintypes.RECT),
-        ("itemData", ctypes.c_size_t),
-    ]
-
-
-_user32.GetDC.argtypes = [wintypes.HWND]
-_user32.GetDC.restype = wintypes.HDC
-_user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
-_user32.ReleaseDC.restype = ctypes.c_int
-_user32.FillRect.argtypes = [wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH]
-_user32.FillRect.restype = ctypes.c_int
-_user32.GetSysColor.argtypes = [ctypes.c_int]
-_user32.GetSysColor.restype = wintypes.DWORD
-_user32.GetSysColorBrush.argtypes = [ctypes.c_int]
-_user32.GetSysColorBrush.restype = wintypes.HBRUSH
-_user32.DrawTextW.argtypes = [
-    wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(wintypes.RECT), wintypes.UINT
-]
-_user32.DrawTextW.restype = ctypes.c_int
-_user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
-_user32.SystemParametersInfoW.restype = wintypes.BOOL
-_user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
-_user32.LoadCursorW.restype = wintypes.HANDLE
-_user32.SetCursor.argtypes = [wintypes.HANDLE]
-_user32.SetCursor.restype = wintypes.HANDLE
-
-_gdi32.CreateFontIndirectW.argtypes = [ctypes.POINTER(_LOGFONTW)]
-_gdi32.CreateFontIndirectW.restype = wintypes.HFONT
-_gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
-_gdi32.SelectObject.restype = wintypes.HGDIOBJ
-_gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
-_gdi32.DeleteObject.restype = wintypes.BOOL
-_gdi32.SetBkMode.argtypes = [wintypes.HDC, ctypes.c_int]
-_gdi32.SetBkMode.restype = ctypes.c_int
-_gdi32.SetTextColor.argtypes = [wintypes.HDC, wintypes.DWORD]
-_gdi32.SetTextColor.restype = wintypes.DWORD
-_gdi32.GetTextExtentPoint32W.argtypes = [
-    wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(wintypes.SIZE)
-]
-_gdi32.GetTextExtentPoint32W.restype = wintypes.BOOL
-
-if _uxtheme is not None:
-    _uxtheme.OpenThemeData.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
-    _uxtheme.OpenThemeData.restype = ctypes.c_void_p
-    _uxtheme.CloseThemeData.argtypes = [ctypes.c_void_p]
-    _uxtheme.CloseThemeData.restype = ctypes.c_long
-    _uxtheme.DrawThemeBackground.argtypes = [
-        ctypes.c_void_p, wintypes.HDC, ctypes.c_int, ctypes.c_int,
-        ctypes.POINTER(wintypes.RECT), ctypes.POINTER(wintypes.RECT),
-    ]
-    _uxtheme.DrawThemeBackground.restype = ctypes.c_long
-
-
-class StaticListTrayIcon(_Win32Icon):
-    """pystray Icon that renders disabled menu items as static black text with no hover."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+        self._lock = threading.Lock()
+        self._state = "scanning"
+        self._tooltip = f"{APP_NAME} — Starting..."
+        self._hwnd: Optional[int] = None
+        self._hicons: Dict[str, int] = {}
         self._ownerdraw_labels: Dict[int, str] = {}
         self._menu_font: Optional[int] = None
         self._menu_theme: Optional[int] = None
         self._font_px: int = 14
         self._arrow_cursor = _user32.LoadCursorW(None, ctypes.c_void_p(_IDC_ARROW))
-        self._message_handlers[_WM_SETCURSOR] = self._on_set_cursor
-        self._message_handlers[_WM_MEASUREITEM] = self._on_measure_item
-        self._message_handlers[_WM_DRAWITEM] = self._on_draw_item
+        self._wm_taskbar_created = _user32.RegisterWindowMessageW("TaskbarCreated")
+        self._wndproc_ref = _WNDPROC(self._wndproc)
 
-    def _on_set_cursor(self, wparam, lparam) -> int:
-        if self._arrow_cursor:
-            _user32.SetCursor(self._arrow_cursor)
-            return 1
-        return 0
+    def update(self, state: str, tooltip: str) -> None:
+        with self._lock:
+            self._state = state
+            self._tooltip = tooltip[:127]
+        if self._hwnd:
+            _user32.PostMessageW(self._hwnd, _WM_APP_UPDATE_TRAY, 0, 0)
+
+    def stop(self) -> None:
+        if self._hwnd:
+            _user32.PostMessageW(self._hwnd, _WM_APP_QUIT_TRAY, 0, 0)
 
     def _ensure_menu_resources(self) -> None:
         if self._menu_font is None:
@@ -392,49 +720,99 @@ class StaticListTrayIcon(_Win32Icon):
                 self._menu_font = _gdi32.CreateFontIndirectW(ctypes.byref(ncm.lfMenuFont))
                 if ncm.lfMenuFont.lfHeight:
                     self._font_px = abs(ncm.lfMenuFont.lfHeight)
-        if self._menu_theme is None and _uxtheme is not None and self._menu_hwnd:
-            self._menu_theme = _uxtheme.OpenThemeData(self._menu_hwnd, "MENU")
+        if self._menu_theme is None and _uxtheme is not None and self._hwnd:
+            self._menu_theme = _uxtheme.OpenThemeData(self._hwnd, "MENU")
 
-    def _mark_ready(self) -> None:
-        if self._menu_hwnd:
-            self._HWND_TO_ICON[self._menu_hwnd] = self
-        super()._mark_ready()
+    def _shell_notify(self, message: int, hwnd: int) -> None:
+        with self._lock:
+            hicon = self._hicons.get(self._state, self._hicons.get("online", 0))
+            tip = self._tooltip
+        nid = _NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+        nid.hWnd = hwnd
+        nid.uID = 1
+        nid.uFlags = _NIF_MESSAGE | _NIF_ICON | _NIF_TIP
+        nid.uCallbackMessage = _WM_TRAYICON
+        nid.hIcon = hicon
+        nid.szTip = tip
+        _shell32.Shell_NotifyIconW(message, ctypes.byref(nid))
 
-    def _on_stop(self, wparam, lparam):
-        if self._menu_hwnd:
-            self._HWND_TO_ICON.pop(self._menu_hwnd, None)
-        if self._menu_font:
-            _gdi32.DeleteObject(self._menu_font)
-            self._menu_font = None
-        if self._menu_theme and _uxtheme is not None:
-            _uxtheme.CloseThemeData(self._menu_theme)
-            self._menu_theme = None
-        return super()._on_stop(wparam, lparam)
+    def _show_context_menu(self, hwnd: int) -> None:
+        labels, notif_enabled = self._get_menu_state()
+        hmenu = _user32.CreatePopupMenu()
+        if not hmenu:
+            return
 
-    def _update_menu(self) -> None:
         self._ownerdraw_labels.clear()
-        super()._update_menu()
+        pos = 0
 
-    def _create_menu_item(self, descriptor, callbacks):
-        if descriptor is not pystray.Menu.SEPARATOR and not descriptor.enabled:
-            item_id = len(callbacks)
-            self._ownerdraw_labels[item_id] = descriptor.text
-            return _pystray_win32.MENUITEMINFO(
-                cbSize=ctypes.sizeof(_pystray_win32.MENUITEMINFO),
-                fMask=(
-                    _pystray_win32.MIIM_ID
-                    | _pystray_win32.MIIM_FTYPE
-                    | _pystray_win32.MIIM_STATE
-                    | _pystray_win32.MIIM_DATA
-                ),
-                wID=item_id,
-                fType=_pystray_win32.MFT_OWNERDRAW,
-                fState=_pystray_win32.MFS_DISABLED,
-                dwItemData=item_id,
+        try:
+            display_labels = labels if labels else ["No devices found yet"]
+            for idx, text in enumerate(display_labels, start=1):
+                self._ownerdraw_labels[idx] = text
+                mii = _MENUITEMINFOW()
+                mii.cbSize = ctypes.sizeof(_MENUITEMINFOW)
+                mii.fMask = _MIIM_ID | _MIIM_FTYPE | _MIIM_STATE | _MIIM_DATA
+                mii.wID = idx
+                mii.fType = _MFT_OWNERDRAW
+                mii.fState = _MFS_DISABLED
+                mii.dwItemData = idx
+                _user32.InsertMenuItemW(hmenu, pos, True, ctypes.byref(mii))
+                pos += 1
+
+            # Separator
+            sep1 = _MENUITEMINFOW(
+                cbSize=ctypes.sizeof(_MENUITEMINFOW), fMask=_MIIM_FTYPE, fType=_MFT_SEPARATOR
             )
-        return super()._create_menu_item(descriptor, callbacks)
+            _user32.InsertMenuItemW(hmenu, pos, True, ctypes.byref(sep1))
+            pos += 1
 
-    def _on_measure_item(self, wparam, lparam) -> int:
+            # Notifications toggle
+            notif = _MENUITEMINFOW()
+            notif.cbSize = ctypes.sizeof(_MENUITEMINFOW)
+            notif.fMask = _MIIM_ID | _MIIM_FTYPE | _MIIM_STATE | _MIIM_STRING
+            notif.wID = _MENU_ID_NOTIFICATIONS
+            notif.fType = _MFT_STRING
+            notif.fState = _MFS_CHECKED if notif_enabled else 0
+            notif.dwTypeData = "Notifications"
+            _user32.InsertMenuItemW(hmenu, pos, True, ctypes.byref(notif))
+            pos += 1
+
+            # Separator
+            sep2 = _MENUITEMINFOW(
+                cbSize=ctypes.sizeof(_MENUITEMINFOW), fMask=_MIIM_FTYPE, fType=_MFT_SEPARATOR
+            )
+            _user32.InsertMenuItemW(hmenu, pos, True, ctypes.byref(sep2))
+            pos += 1
+
+            # Quit
+            quit_item = _MENUITEMINFOW()
+            quit_item.cbSize = ctypes.sizeof(_MENUITEMINFOW)
+            quit_item.fMask = _MIIM_ID | _MIIM_FTYPE | _MIIM_STRING
+            quit_item.wID = _MENU_ID_QUIT
+            quit_item.fType = _MFT_STRING
+            quit_item.dwTypeData = "Quit"
+            _user32.InsertMenuItemW(hmenu, pos, True, ctypes.byref(quit_item))
+
+            _user32.SetForegroundWindow(hwnd)
+            pt = wintypes.POINT()
+            _user32.GetCursorPos(ctypes.byref(pt))
+            cmd = _user32.TrackPopupMenuEx(
+                hmenu,
+                _TPM_RIGHTALIGN | _TPM_BOTTOMALIGN | _TPM_RETURNCMD,
+                pt.x,
+                pt.y,
+                hwnd,
+                None,
+            )
+            if cmd == _MENU_ID_NOTIFICATIONS:
+                self._on_toggle_notifications()
+            elif cmd == _MENU_ID_QUIT:
+                self._on_quit()
+        finally:
+            _user32.DestroyMenu(hmenu)
+
+    def _on_measure_item(self, hwnd: int, lparam: int) -> int:
         mis = _MEASUREITEMSTRUCT.from_address(lparam)
         if mis.CtlType != _ODT_MENU:
             return 0
@@ -442,7 +820,7 @@ class StaticListTrayIcon(_Win32Icon):
         if text is None:
             return 0
         self._ensure_menu_resources()
-        hdc = _user32.GetDC(self._menu_hwnd)
+        hdc = _user32.GetDC(hwnd)
         if hdc:
             try:
                 old_font = _gdi32.SelectObject(hdc, self._menu_font) if self._menu_font else None
@@ -455,10 +833,10 @@ class StaticListTrayIcon(_Win32Icon):
                 mis.itemWidth = size.cx + left_pad + right_pad
                 mis.itemHeight = max(size.cy + 10, int(self._font_px * 1.9))
             finally:
-                _user32.ReleaseDC(self._menu_hwnd, hdc)
+                _user32.ReleaseDC(hwnd, hdc)
         return 1
 
-    def _on_draw_item(self, wparam, lparam) -> int:
+    def _on_draw_item(self, lparam: int) -> int:
         dis = _DRAWITEMSTRUCT.from_address(lparam)
         if dis.CtlType != _ODT_MENU:
             return 0
@@ -469,7 +847,6 @@ class StaticListTrayIcon(_Win32Icon):
         hdc = dis.hDC
         rc = dis.rcItem
 
-        # Always paint plain menu background (ignore ODS_SELECTED -> zero hover highlight)
         if self._menu_theme and _uxtheme is not None:
             _uxtheme.DrawThemeBackground(
                 self._menu_theme, hdc, _MENU_POPUPBACKGROUND, 0, ctypes.byref(rc), None
@@ -491,144 +868,80 @@ class StaticListTrayIcon(_Win32Icon):
             _gdi32.SelectObject(hdc, old_font)
         return 1
 
+    def _wndproc(self, hwnd: int, msg: int, wparam: int, lparam: int) -> int:
+        if msg == _WM_SETCURSOR:
+            if self._arrow_cursor:
+                _user32.SetCursor(self._arrow_cursor)
+                return 1
+        elif msg == _WM_TRAYICON:
+            if lparam == _WM_RBUTTONUP:
+                self._show_context_menu(hwnd)
+            return 0
+        elif msg == _WM_MEASUREITEM:
+            return self._on_measure_item(hwnd, lparam)
+        elif msg == _WM_DRAWITEM:
+            return self._on_draw_item(lparam)
+        elif msg == _WM_APP_UPDATE_TRAY:
+            self._shell_notify(_NIM_MODIFY, hwnd)
+            return 0
+        elif msg == _WM_APP_QUIT_TRAY:
+            self._shell_notify(_NIM_DELETE, hwnd)
+            _user32.DestroyWindow(hwnd)
+            return 0
+        elif msg == self._wm_taskbar_created and self._wm_taskbar_created:
+            self._shell_notify(_NIM_ADD, hwnd)
+            return 0
+        elif msg == _WM_DESTROY:
+            _user32.PostQuitMessage(0)
+            return 0
+        return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
-# Native Win32 custom toast notification (dark rounded card, no '...' button)
-_WS_POPUP = 0x80000000
-_WS_EX_TOPMOST = 0x00000008
-_WS_EX_TOOLWINDOW = 0x00000080
-_WS_EX_NOACTIVATE = 0x08000000
-_SW_HIDE = 0
-_SW_SHOWNOACTIVATE = 4
-_SWP_NOACTIVATE = 0x0010
-_SWP_SHOWWINDOW = 0x0040
-_HWND_TOPMOST = -1
-_WM_DESTROY = 0x0002
-_WM_PAINT = 0x000F
-_WM_TIMER = 0x0113
-_WM_LBUTTONUP = 0x0202
-_WM_APP_SHOW_TOAST = 0x8010
-_WM_APP_QUIT_TOAST = 0x8011
-_SPI_GETWORKAREA = 0x0030
-_DWMWA_WINDOW_CORNER_PREFERENCE = 33
-_DWMWCP_ROUND = 2
-_DT_END_ELLIPSIS = 0x00008000
-_DT_RIGHT = 0x00000002
-_FW_NORMAL = 400
-_FW_SEMIBOLD = 600
-_DEFAULT_CHARSET = 1
-_CLEARTYPE_QUALITY = 5
-_TOAST_TIMER_ID = 1
-_TOAST_DURATION_MS = 6000
+    def run(self) -> None:
+        hinst = _kernel32.GetModuleHandleW(None)
+        cls_name = f"WiFiMonitorTray_{id(self)}"
 
+        for state in ("online", "scanning", "offline"):
+            self._hicons[state] = pil_to_hicon(create_tray_icon_image(state))
 
-def _rgb(r: int, g: int, b: int) -> int:
-    return r | (g << 8) | (b << 16)
+        wc = _WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(_WNDCLASSEXW)
+        wc.lpfnWndProc = self._wndproc_ref
+        wc.hInstance = hinst
+        wc.hCursor = self._arrow_cursor
+        wc.lpszClassName = cls_name
+        _user32.RegisterClassExW(ctypes.byref(wc))
 
+        hwnd = _user32.CreateWindowExW(
+            0, cls_name, APP_NAME, _WS_POPUP,
+            0, 0, 0, 0, None, None, hinst, None,
+        )
+        self._hwnd = hwnd
+        self._shell_notify(_NIM_ADD, hwnd)
 
-_WNDPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
-)
+        threading.Thread(target=self._on_ready, daemon=True).start()
 
+        msg = wintypes.MSG()
+        while _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            _user32.TranslateMessage(ctypes.byref(msg))
+            _user32.DispatchMessageW(ctypes.byref(msg))
 
-class _WNDCLASSEXW(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.UINT),
-        ("style", wintypes.UINT),
-        ("lpfnWndProc", _WNDPROC),
-        ("cbClsExtra", ctypes.c_int),
-        ("cbWndExtra", ctypes.c_int),
-        ("hInstance", wintypes.HINSTANCE),
-        ("hIcon", wintypes.HICON),
-        ("hCursor", wintypes.HANDLE),
-        ("hbrBackground", wintypes.HBRUSH),
-        ("lpszMenuName", wintypes.LPCWSTR),
-        ("lpszClassName", wintypes.LPCWSTR),
-        ("hIconSm", wintypes.HICON),
-    ]
-
-
-class _PAINTSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("hdc", wintypes.HDC),
-        ("fErase", wintypes.BOOL),
-        ("rcPaint", wintypes.RECT),
-        ("fRestore", wintypes.BOOL),
-        ("fIncUpdate", wintypes.BOOL),
-        ("rgbReserved", ctypes.c_byte * 32),
-    ]
-
-
-_kernel32 = ctypes.windll.kernel32
-_kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
-_kernel32.GetModuleHandleW.restype = wintypes.HMODULE
-
-_user32.RegisterClassExW.argtypes = [ctypes.POINTER(_WNDCLASSEXW)]
-_user32.RegisterClassExW.restype = wintypes.ATOM
-_user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
-_user32.UnregisterClassW.restype = wintypes.BOOL
-_user32.CreateWindowExW.argtypes = [
-    wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
-    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-    wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
-]
-_user32.CreateWindowExW.restype = wintypes.HWND
-_user32.DestroyWindow.argtypes = [wintypes.HWND]
-_user32.DestroyWindow.restype = wintypes.BOOL
-_user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-_user32.DefWindowProcW.restype = ctypes.c_ssize_t
-_user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-_user32.ShowWindow.restype = wintypes.BOOL
-_user32.SetWindowPos.argtypes = [
-    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
-    ctypes.c_int, ctypes.c_int, wintypes.UINT,
-]
-_user32.SetWindowPos.restype = wintypes.BOOL
-_user32.InvalidateRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT), wintypes.BOOL]
-_user32.InvalidateRect.restype = wintypes.BOOL
-_user32.BeginPaint.argtypes = [wintypes.HWND, ctypes.POINTER(_PAINTSTRUCT)]
-_user32.BeginPaint.restype = wintypes.HDC
-_user32.EndPaint.argtypes = [wintypes.HWND, ctypes.POINTER(_PAINTSTRUCT)]
-_user32.EndPaint.restype = wintypes.BOOL
-_user32.FrameRect.argtypes = [wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH]
-_user32.FrameRect.restype = ctypes.c_int
-_user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, wintypes.UINT, ctypes.c_void_p]
-_user32.SetTimer.restype = ctypes.c_size_t
-_user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
-_user32.KillTimer.restype = wintypes.BOOL
-_user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-_user32.PostMessageW.restype = wintypes.BOOL
-_user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
-_user32.GetMessageW.restype = wintypes.BOOL
-_user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
-_user32.TranslateMessage.restype = wintypes.BOOL
-_user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
-_user32.DispatchMessageW.restype = ctypes.c_ssize_t
-_user32.PostQuitMessage.argtypes = [ctypes.c_int]
-_user32.PostQuitMessage.restype = None
-
-_gdi32.CreateSolidBrush.argtypes = [wintypes.DWORD]
-_gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
-_gdi32.CreatePen.argtypes = [ctypes.c_int, ctypes.c_int, wintypes.DWORD]
-_gdi32.CreatePen.restype = wintypes.HPEN
-_gdi32.Ellipse.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
-_gdi32.Ellipse.restype = wintypes.BOOL
-_gdi32.CreateFontW.argtypes = [
-    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-    wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
-    wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.LPCWSTR,
-]
-_gdi32.CreateFontW.restype = wintypes.HFONT
-
-try:
-    _dwmapi = ctypes.windll.dwmapi
-    _dwmapi.DwmSetWindowAttribute.argtypes = [
-        wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD
-    ]
-    _dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
-except OSError:
-    _dwmapi = None
+        if self._menu_font:
+            _gdi32.DeleteObject(self._menu_font)
+            self._menu_font = None
+        if self._menu_theme and _uxtheme is not None:
+            _uxtheme.CloseThemeData(self._menu_theme)
+            self._menu_theme = None
+        for hicon in self._hicons.values():
+            if hicon:
+                _user32.DestroyIcon(hicon)
+        self._hicons.clear()
+        _user32.UnregisterClassW(cls_name, hinst)
+        self._hwnd = None
 
 
+# ---------------------------------------------------------------------------
+# Custom Dark Win32 Toast Notification (no '...' menu button)
+# ---------------------------------------------------------------------------
 class ToastPopup:
     """Clean, dark Windows 11-style notification box without the '...' menu button."""
 
@@ -644,6 +957,7 @@ class ToastPopup:
         self._ready = threading.Event()
         self._wndproc_ref = _WNDPROC(self._wndproc)
         self._thread: Optional[threading.Thread] = None
+        self._arrow_cursor = _user32.LoadCursorW(None, ctypes.c_void_p(_IDC_ARROW))
         self._font_header = None
         self._font_title = None
         self._font_body = None
@@ -675,7 +989,7 @@ class ToastPopup:
         wc.cbSize = ctypes.sizeof(_WNDCLASSEXW)
         wc.lpfnWndProc = self._wndproc_ref
         wc.hInstance = hinst
-        wc.hCursor = _user32.LoadCursorW(None, ctypes.c_void_p(_IDC_ARROW))
+        wc.hCursor = self._arrow_cursor
         wc.lpszClassName = cls_name
         _user32.RegisterClassExW(ctypes.byref(wc))
 
@@ -747,7 +1061,6 @@ class ToastPopup:
             _gdi32.DeleteObject(bg_brush)
             _gdi32.DeleteObject(border_brush)
 
-            # Accent status dot next to app name
             dot_brush = _gdi32.CreateSolidBrush(accent)
             dot_pen = _gdi32.CreatePen(0, 1, accent)
             old_brush = _gdi32.SelectObject(hdc, dot_brush)
@@ -760,7 +1073,6 @@ class ToastPopup:
 
             _gdi32.SetBkMode(hdc, _TRANSPARENT)
 
-            # Header: "WiFi Monitor" + subtle close '×'
             old_font = _gdi32.SelectObject(hdc, self._font_header)
             _gdi32.SetTextColor(hdc, _rgb(190, 195, 205))
             hdr_rc = wintypes.RECT(34, 12, self.WIDTH - 36, 32)
@@ -770,7 +1082,6 @@ class ToastPopup:
             close_rc = wintypes.RECT(self.WIDTH - 32, 10, self.WIDTH - 14, 30)
             _user32.DrawTextW(hdc, "\u00D7", -1, ctypes.byref(close_rc), _DT_RIGHT | _DT_VCENTER | _DT_SINGLELINE)
 
-            # Title
             _gdi32.SelectObject(hdc, self._font_title)
             _gdi32.SetTextColor(hdc, _rgb(245, 247, 250))
             title_rc = wintypes.RECT(16, 40, self.WIDTH - 16, 62)
@@ -779,7 +1090,6 @@ class ToastPopup:
                 _DT_LEFT | _DT_VCENTER | _DT_SINGLELINE | _DT_END_ELLIPSIS | _DT_NOPREFIX,
             )
 
-            # Body
             _gdi32.SelectObject(hdc, self._font_body)
             _gdi32.SetTextColor(hdc, _rgb(175, 180, 190))
             body_rc = wintypes.RECT(16, 64, self.WIDTH - 16, 84)
@@ -795,8 +1105,9 @@ class ToastPopup:
 
     def _wndproc(self, hwnd: int, msg: int, wparam: int, lparam: int) -> int:
         if msg == _WM_SETCURSOR:
-            _user32.SetCursor(_user32.LoadCursorW(None, ctypes.c_void_p(_IDC_ARROW)))
-            return 1
+            if self._arrow_cursor:
+                _user32.SetCursor(self._arrow_cursor)
+                return 1
         if msg == _WM_PAINT:
             self._paint(hwnd)
             return 0
@@ -824,6 +1135,9 @@ class ToastPopup:
         return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
 
+# ---------------------------------------------------------------------------
+# Main Application
+# ---------------------------------------------------------------------------
 class WiFiMonitorApp:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -836,53 +1150,31 @@ class WiFiMonitorApp:
         self._notifications_enabled: bool = True
         self._baseline_ready: bool = False
 
-        self._icon_online = create_tray_icon_image("online")
-        self._icon_scanning = create_tray_icon_image("scanning")
-        self._icon_offline = create_tray_icon_image("offline")
         self._toast = ToastPopup()
-
-        self.icon = StaticListTrayIcon(
-            name="wifi_monitor",
-            icon=self._icon_scanning,
-            title=f"{APP_NAME} — Starting...",
-            menu=self._build_menu(),
+        self._tray = NativeTrayIcon(
+            get_menu_state=self._get_menu_state,
+            on_toggle_notifications=self._on_toggle_notifications,
+            on_quit=self._on_quit,
+            on_ready=self._on_ready,
         )
 
-    def _build_menu(self) -> pystray.Menu:
+    def _get_menu_state(self) -> Tuple[List[str], bool]:
         with self._lock:
             devices = sorted(self._devices.values(), key=lambda d: ip_sort_key(d.ip))
+            labels = [
+                f"{d.ip}  —  {d.hostname}{' (This PC)' if d.is_local else ''}"
+                for d in devices
+            ]
+            return labels, self._notifications_enabled
 
-        items: List[pystray.MenuItem] = []
+    def _on_toggle_notifications(self) -> None:
+        with self._lock:
+            self._notifications_enabled = not self._notifications_enabled
 
-        if devices:
-            for dev in devices:
-                tag = " (This PC)" if dev.is_local else ""
-                label = f"{dev.ip}  —  {dev.hostname}{tag}"
-                items.append(pystray.MenuItem(label, None, enabled=False))
-        else:
-            items.append(pystray.MenuItem("No devices found yet", None, enabled=False))
-
-        items.append(pystray.Menu.SEPARATOR)
-        items.append(
-            pystray.MenuItem(
-                "Notifications",
-                self._on_toggle_notifications,
-                checked=lambda _: self._notifications_enabled,
-            )
-        )
-        items.append(pystray.Menu.SEPARATOR)
-        items.append(pystray.MenuItem("Quit", self._on_quit))
-
-        return pystray.Menu(*items)
-
-    def _on_toggle_notifications(self, icon: _Win32Icon, item: pystray.MenuItem) -> None:
-        self._notifications_enabled = not self._notifications_enabled
-        self._refresh_tray()
-
-    def _on_quit(self, icon: _Win32Icon, item: pystray.MenuItem) -> None:
+    def _on_quit(self) -> None:
         self._stop_event.set()
         self._toast.stop()
-        icon.stop()
+        self._tray.stop()
 
     def _refresh_tray(self) -> None:
         with self._lock:
@@ -891,24 +1183,18 @@ class WiFiMonitorApp:
             scanning = self._is_scanning
 
         if scanning:
-            self.icon.icon = self._icon_scanning
-            self.icon.title = f"{APP_NAME} — Scanning..."
+            self._tray.update("scanning", f"{APP_NAME} — Scanning...")
         elif not subnet:
-            self.icon.icon = self._icon_offline
-            self.icon.title = f"{APP_NAME} — Offline"
+            self._tray.update("offline", f"{APP_NAME} — Offline")
         else:
-            self.icon.icon = self._icon_online
-            self.icon.title = f"{APP_NAME} — {count} device{'s' if count != 1 else ''} online"
-
-        self.icon.menu = self._build_menu()
-        try:
-            self.icon.update_menu()
-        except Exception:
-            pass
+            self._tray.update(
+                "online", f"{APP_NAME} — {count} device{'s' if count != 1 else ''} online"
+            )
 
     def _notify(self, title: str, message: str, is_join: bool = True) -> None:
-        if not self._notifications_enabled:
-            return
+        with self._lock:
+            if not self._notifications_enabled:
+                return
         try:
             self._toast.show(title, message, is_join=is_join)
         except Exception:
@@ -936,7 +1222,6 @@ class WiFiMonitorApp:
         prefix = ".".join(local_ip.split(".")[:-1]) + "."
         src_ip_int = struct.unpack("<I", socket.inet_aton(local_ip))[0]
 
-        # If we switched Wi-Fi networks, reset state silently
         subnet_changed = False
         with self._lock:
             if self._current_subnet is not None and self._current_subnet != prefix:
@@ -962,7 +1247,6 @@ class WiFiMonitorApp:
         candidate_ips = (set(arp_candidates.values()) | tracked_ips) - {local_ip}
 
         # Stage 2: Verify only the small set of candidates with live SendARP
-        # (prevents Windows' stale ARP cache from keeping offline devices listed)
         discovered: Dict[str, str] = {}
         if candidate_ips and not self._stop_event.is_set():
             workers = min(len(candidate_ips), 32)
@@ -1008,7 +1292,6 @@ class WiFiMonitorApp:
         state_changed = subnet_changed
 
         with self._lock:
-            # Update existing & add newly joined devices
             for mac, ip in discovered.items():
                 hostname = self._hostname_cache.get(mac, "Unknown device")
                 is_local = ip == local_ip
@@ -1027,7 +1310,6 @@ class WiFiMonitorApp:
                     if self._baseline_ready and not is_local:
                         joined.append(new_dev)
 
-            # Check for missing devices (with grace period)
             to_remove: List[str] = []
             for mac, dev in self._devices.items():
                 if mac not in discovered:
@@ -1047,7 +1329,6 @@ class WiFiMonitorApp:
         if state_changed or show_indicator:
             self._refresh_tray()
 
-        # Send consolidated notifications
         if joined:
             if len(joined) == 1:
                 d = joined[0]
@@ -1084,16 +1365,14 @@ class WiFiMonitorApp:
                     self._is_scanning = False
                 self._refresh_tray()
 
-            # Sleep with 0% CPU until next fast check (5s)
             self._stop_event.wait(timeout=FAST_CHECK_INTERVAL_SECONDS)
 
-    def _on_setup(self, icon: _Win32Icon) -> None:
-        icon.visible = True
+    def _on_ready(self) -> None:
         self._toast.start()
         self._background_loop()
 
     def run(self) -> None:
-        self.icon.run(setup=self._on_setup)
+        self._tray.run()
 
 
 def main() -> None:
@@ -1104,7 +1383,7 @@ def main() -> None:
         app = WiFiMonitorApp()
         app.run()
     finally:
-        ctypes.windll.kernel32.CloseHandle(mutex)
+        _kernel32.CloseHandle(mutex)
 
 
 if __name__ == "__main__":
